@@ -18,7 +18,8 @@ use std::io;
 use std::path::Path;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use solana_sdk::signature::{Keypair, Signer};
+use solana_keypair::Keypair;
+use solana_signer::Signer;
 
 /// Filename of the raw 32-byte Ed25519 node seed.
 pub const NODE_KEY_FILE: &str = "node_key";

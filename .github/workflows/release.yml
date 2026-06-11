@@ -16,7 +16,9 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: nexus-client-macos-arm64
-          - os: macos-13
+          # x64 mac is cross-compiled from the arm64 runner — GitHub
+          # retired the macos-13 (Intel) runner pool.
+          - os: macos-14
             target: x86_64-apple-darwin
             asset: nexus-client-macos-x64
           - os: ubuntu-22.04
