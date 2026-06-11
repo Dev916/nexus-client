@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: nexus-client-macos-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: nexus-client-macos-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: nexus-client-linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: nexus-client-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage asset (unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/nexus-client ${{ matrix.asset }}
+      - name: Stage asset (windows)
+        if: runner.os == 'Windows'
+        run: cp target/${{ matrix.target }}/release/nexus-client.exe ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum nexus-client-* > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "nexus-client ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            nexus-client-* SHA256SUMS

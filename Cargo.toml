@@ -1,0 +1,57 @@
+[package]
+name = "nexus-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Lend your GPU to the Nexus compute network and earn GNN. Wraps a local OpenAI-compatible inference server (Ollama, vLLM, llama.cpp) and serves metered jobs."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Dev916/nexus-client"
+homepage = "https://ghostnn.ai/nexus-client"
+
+[lib]
+name = "nexus_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexus-client"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["std"] }
+bs58 = "0.5"
+solana-sdk = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+# rustls-tls-webpki-roots so wss:// gateways work everywhere without
+# linking system OpenSSL — required for the production gateway URL.
+tokio-tungstenite = { version = "0.20", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+ed25519-dalek = { version = "2", features = ["std"] }
+bs58 = "0.5"
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = "thin"
