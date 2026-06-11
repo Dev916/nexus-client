@@ -53,7 +53,7 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Connect to the gateway and serve jobs (not implemented in T5).
+    /// Connect to the gateway and serve inference jobs from your local model.
     Start {
         #[arg(long)]
         dir: Option<PathBuf>,
