@@ -1,6 +1,6 @@
 [package]
 name = "nexus-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.93"
 description = "Lend your GPU to the Nexus compute network and earn GNN. Wraps a local OpenAI-compatible inference server (Ollama, vLLM, llama.cpp) and serves metered jobs."
@@ -18,13 +18,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-ed25519-dalek = { version = "2", features = ["std"] }
+ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
 bs58 = "0.5"
 solana-keypair = "2"
 solana-signer = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+zeroize = "1"
 dirs = "5"
 rand = "0.8"
 tokio = { version = "1", features = ["full"] }
@@ -49,7 +50,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-ed25519-dalek = { version = "2", features = ["std"] }
+ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
 bs58 = "0.5"
 serde_json = "1"
 

@@ -153,7 +153,8 @@ async fn spawn_mock_gateway(job_body: serde_json::Value, tx: mpsc::Sender<Gatewa
 }
 
 /// Verify the client's auth frame: decode node_pubkey + signature (base58)
-/// and `verify_strict` over the raw nonce bytes — exactly the server's rule.
+/// and `verify_strict` over the DOMAIN-SEPARATED message (AUTH_DOMAIN_TAG ++
+/// nonce) — exactly the server's NX-1 rule.
 fn verify_auth(v: &serde_json::Value, nonce: &[u8; 32]) -> bool {
     let Some(pk_b58) = v.get("node_pubkey").and_then(|x| x.as_str()) else { return false };
     let Some(sig_b58) = v.get("signature").and_then(|x| x.as_str()) else { return false };
@@ -163,7 +164,11 @@ fn verify_auth(v: &serde_json::Value, nonce: &[u8; 32]) -> bool {
     let Ok(sig_bytes) = bs58::decode(sig_b58).into_vec() else { return false };
     let Ok(sig_arr): Result<[u8; 64], _> = sig_bytes.try_into() else { return false };
     let sig = Signature::from_bytes(&sig_arr);
-    vk.verify_strict(nonce, &sig).is_ok()
+    const AUTH_DOMAIN_TAG: &[u8] = b"nexus-compute-node-auth:v1\n";
+    let mut message = Vec::with_capacity(AUTH_DOMAIN_TAG.len() + nonce.len());
+    message.extend_from_slice(AUTH_DOMAIN_TAG);
+    message.extend_from_slice(nonce);
+    vk.verify_strict(&message, &sig).is_ok()
 }
 
 fn rand_nonce() -> [u8; 32] {
@@ -297,6 +302,18 @@ async fn reconnects_with_increasing_backoff() {
         recorded[1],
         recorded[0]
     );
-    assert_eq!(recorded[0], Duration::from_secs(1), "first backoff is the 1s floor");
-    assert_eq!(recorded[1], Duration::from_secs(2), "second backoff doubles to 2s");
+    // Delays are jittered ±25% around the 1s→2s doubling schedule (NX-6),
+    // so assert the bands, not exact values: first ∈ [750ms,1250ms],
+    // second ∈ [1500ms,2500ms]. The bands don't overlap, so the strict
+    // ordering checked above holds for every draw.
+    assert!(
+        recorded[0] >= Duration::from_millis(750) && recorded[0] <= Duration::from_millis(1250),
+        "first backoff {:?} outside jittered 1s band",
+        recorded[0]
+    );
+    assert!(
+        recorded[1] >= Duration::from_millis(1500) && recorded[1] <= Duration::from_millis(2500),
+        "second backoff {:?} outside jittered 2s band",
+        recorded[1]
+    );
 }

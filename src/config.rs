@@ -72,13 +72,17 @@ impl Config {
         toml::from_str(s)
     }
 
-    /// Write the config to `<dir>/config.toml`.
+    /// Write the config to `<dir>/config.toml`, created atomically and
+    /// refusing to overwrite (NX-8) — config isn't secret but the
+    /// exclusive-create keeps a second `init` from silently clobbering a
+    /// host's tuned settings. Non-secret, so no 0600 requirement, but
+    /// reusing the same primitive keeps the create-new guarantee.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         let path = dir.join(CONFIG_FILE);
         let toml = self
             .to_toml()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        fs::write(path, toml)
+        crate::keys::write_new_secure(&path, toml.as_bytes())
     }
 
     /// Load the config from `<dir>/config.toml`.

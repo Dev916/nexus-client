@@ -14,17 +14,42 @@
 //!     and the rest of the Solana tooling read/write.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Filename of the raw 32-byte Ed25519 node seed.
 pub const NODE_KEY_FILE: &str = "node_key";
 /// Filename of the Solana wallet (64-byte JSON array, solana-tooling format).
 pub const WALLET_FILE: &str = "wallet.json";
+
+/// Atomically create `path` (refusing to overwrite) with owner-only
+/// permissions and write `bytes`. This is the single safe-write primitive
+/// for every secret/config file the client persists (NX-8/NX-9):
+///   * `create_new(true)` makes creation atomic + exclusive at the OS
+///     level — no check-then-write TOCTOU, and an existing file is never
+///     clobbered (protects the only copy of a payout key).
+///   * On Unix the file is created with mode 0600 BEFORE any bytes land,
+///     so the secret is never briefly group/other-readable.
+///   * On Windows (where the binary also ships) the file inherits the
+///     parent-dir ACL; we surface that rather than silently no-op.
+pub fn write_new_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
 
 /// The client's Ed25519 node identity. Wraps a `SigningKey`; the seed is
 /// the 32 bytes persisted to `node_key`.
@@ -33,10 +58,11 @@ pub struct NodeKey {
 }
 
 impl NodeKey {
-    /// Generate a fresh random node key.
+    /// Generate a fresh random node key. The transient seed buffer is
+    /// zeroized on drop (NX-7).
     pub fn generate() -> Self {
-        let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        let mut seed = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, seed.as_mut());
         Self {
             signing: SigningKey::from_bytes(&seed),
         }
@@ -63,35 +89,38 @@ impl NodeKey {
         bs58::encode(sig.to_bytes()).into_string()
     }
 
-    /// Write the raw 32-byte seed to `<dir>/node_key` with mode 0600.
-    /// Refuses (errors) if the file already exists, so an existing identity
-    /// is never silently overwritten.
+    /// Write the raw 32-byte seed to `<dir>/node_key`, created atomically
+    /// with mode 0600 and refusing to overwrite an existing identity
+    /// (NX-8/NX-9). The seed bytes are zeroized after writing (NX-7).
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         let path = dir.join(NODE_KEY_FILE);
-        if path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "already initialized",
-            ));
-        }
-        fs::write(&path, self.signing.to_bytes())?;
-        set_mode_0600(&path)?;
-        Ok(())
+        let seed = Zeroizing::new(self.signing.to_bytes());
+        write_new_secure(&path, seed.as_ref()).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(io::ErrorKind::AlreadyExists, "already initialized")
+            } else {
+                e
+            }
+        })
     }
 
-    /// Load a node key from the raw 32-byte seed at `<dir>/node_key`.
+    /// Load a node key from the raw 32-byte seed at `<dir>/node_key`. The
+    /// file bytes are zeroized after the key is constructed (NX-7).
     pub fn load(dir: &Path) -> io::Result<Self> {
         let path = dir.join(NODE_KEY_FILE);
-        let bytes = fs::read(&path)?;
+        let bytes = Zeroizing::new(fs::read(&path)?);
         let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "node_key must be exactly 32 bytes",
             )
         })?;
-        Ok(Self {
+        let mut seed = Zeroizing::new(seed);
+        let key = Self {
             signing: SigningKey::from_bytes(&seed),
-        })
+        };
+        seed.zeroize();
+        Ok(key)
     }
 }
 
@@ -107,34 +136,39 @@ pub fn generate_wallet() -> Keypair {
 
 /// Write a Solana keypair to `<dir>/wallet.json` in the standard 64-byte
 /// JSON array format (`[u8; 64]` = secret 32 || pubkey 32) that the Solana
-/// CLI tooling reads. Mode 0600.
+/// CLI tooling reads. Created atomically with mode 0600, refusing to
+/// overwrite (NX-8/NX-9). The serialized secret bytes are zeroized (NX-7).
 pub fn save_wallet(wallet: &Keypair, dir: &Path) -> io::Result<()> {
     let path = dir.join(WALLET_FILE);
-    let bytes: Vec<u8> = wallet.to_bytes().to_vec();
-    let json = serde_json::to_string(&bytes)?;
-    fs::write(&path, json)?;
-    set_mode_0600(&path)?;
-    Ok(())
+    let bytes = Zeroizing::new(wallet.to_bytes().to_vec());
+    let json = Zeroizing::new(serde_json::to_string(bytes.as_slice())?);
+    write_new_secure(&path, json.as_bytes())
 }
 
-/// Read the wallet pubkey (base58) from `<dir>/wallet.json`.
+/// Read the wallet pubkey (base58) from `<dir>/wallet.json`. The secret
+/// bytes loaded only to derive the pubkey are zeroized (NX-7).
 pub fn load_wallet_pubkey(dir: &Path) -> io::Result<String> {
     let path = dir.join(WALLET_FILE);
-    let json = fs::read_to_string(&path)?;
-    let bytes: Vec<u8> = serde_json::from_str(&json)?;
+    let json = Zeroizing::new(fs::read_to_string(&path)?);
+    let bytes = Zeroizing::new(serde_json::from_str::<Vec<u8>>(&json)?);
     let arr: [u8; 64] = bytes.as_slice().try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "wallet.json must be a 64-byte array",
         )
     })?;
+    let mut arr = Zeroizing::new(arr);
     let wallet = Keypair::try_from(&arr[..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(wallet.pubkey().to_string())
+    let pubkey = wallet.pubkey().to_string();
+    arr.zeroize();
+    Ok(pubkey)
 }
 
-/// Set file permissions to owner-read/write only (0600) on Unix. No-op on
-/// other platforms (where filesystem ACLs differ).
+/// Set file permissions to owner-read/write only (0600) on Unix. Retained
+/// for any post-hoc tightening; the primary write path now creates files
+/// 0600 atomically via [`write_new_secure`]. No-op on non-Unix.
+#[allow(dead_code)]
 fn set_mode_0600(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -220,5 +254,50 @@ mod tests {
 
         let loaded = load_wallet_pubkey(dir.path()).unwrap();
         assert_eq!(loaded, pubkey, "wallet pubkey must survive save→load");
+    }
+
+    // NX-8: wallet.json must refuse to overwrite (it holds the only copy
+    // of the payout key) and leave the original untouched.
+    #[test]
+    fn save_wallet_refuses_overwrite_and_preserves_original() {
+        let dir = tempdir().unwrap();
+        let original = generate_wallet();
+        let original_pubkey = original.pubkey().to_string();
+        save_wallet(&original, dir.path()).unwrap();
+
+        let intruder = generate_wallet();
+        let err = save_wallet(&intruder, dir.path()).expect_err("second wallet save must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // The on-disk wallet is still the original — not clobbered.
+        assert_eq!(load_wallet_pubkey(dir.path()).unwrap(), original_pubkey);
+    }
+
+    // NX-9: wallet.json is created 0600 atomically (never world-readable).
+    #[test]
+    fn wallet_file_is_mode_0600() {
+        let dir = tempdir().unwrap();
+        save_wallet(&generate_wallet(), dir.path()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join(WALLET_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "wallet.json must be owner-only");
+        }
+    }
+
+    // NX-8: write_new_secure is atomic-exclusive — a second write of the
+    // same path errors AlreadyExists and the first content survives.
+    #[test]
+    fn write_new_secure_is_exclusive() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secret");
+        write_new_secure(&path, b"first").unwrap();
+        let err = write_new_secure(&path, b"second").expect_err("overwrite must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"first", "original content preserved");
     }
 }

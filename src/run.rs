@@ -14,6 +14,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::config::Config;
 use crate::keys::NodeKey;
+use crate::limits;
 use crate::protocol::{
     self, AuthFrame, ServerFrame, SseEvent, chunk_frame, done_frame, job_error_frame,
 };
@@ -31,6 +32,15 @@ pub fn next_backoff(prev: Option<Duration>) -> Duration {
         None => BACKOFF_MIN,
         Some(d) => std::cmp::min(d.saturating_mul(2), BACKOFF_MAX),
     }
+}
+
+/// Apply ±25% randomized jitter to a backoff delay (NX-6). Without jitter
+/// a fleet of nodes kicked by the same gateway reconnects in lockstep
+/// (thundering herd). `rand` between the base*0.75 and base*1.25.
+pub fn jittered(base: Duration) -> Duration {
+    let millis = base.as_millis() as f64;
+    let factor = 0.75 + rand::random::<f64>() * 0.5; // [0.75, 1.25)
+    Duration::from_millis((millis * factor) as u64)
 }
 
 /// Why a single connection attempt ended. Drives the reconnect decision.
@@ -57,7 +67,16 @@ pub async fn run(config: Config, node_key: NodeKey, wallet_pubkey: String) -> Se
     let client = reqwest::Client::new();
     let loop_fut = reconnect_loop(
         || async {
-            match tokio_tungstenite::connect_async(&config.gateway).await {
+            // NX-2: cap inbound message/frame size so a hostile gateway
+            // can't memory-amplify with giant frames.
+            let cfg = limits::ws_config();
+            match tokio_tungstenite::connect_async_with_config(
+                &config.gateway,
+                Some(cfg),
+                false,
+            )
+            .await
+            {
                 Ok((ws, _resp)) => Some(ws),
                 Err(e) => {
                     eprintln!("gateway dial failed: {e}");
@@ -115,7 +134,9 @@ where
             SessionOutcome::Disconnected => {
                 let delay = next_backoff(backoff);
                 backoff = Some(delay);
-                sleep_fn(delay).await;
+                // Track the un-jittered schedule for the next doubling;
+                // sleep the jittered value (NX-6).
+                sleep_fn(jittered(delay)).await;
             }
         }
     }
@@ -146,14 +167,18 @@ pub async fn serve(
         }
     };
 
-    let nonce_bytes = match bs58::decode(&challenge_nonce).into_vec() {
+    // NX-1/NX-5: never let the node key sign an attacker-chosen blob.
+    // Require a well-formed, exactly-32-byte challenge before signing.
+    let nonce_bytes = match limits::validate_nonce(&challenge_nonce) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("gateway sent an undecodable nonce: {e}");
+            eprintln!("refusing to sign gateway challenge: {e}");
             return SessionOutcome::Disconnected;
         }
     };
-    let signature = node_key.sign_base58(&nonce_bytes);
+    // NX-1: sign the domain-separated message, not the bare nonce, so the
+    // signature can't be replayed against any other Ed25519 verifier.
+    let signature = node_key.sign_base58(&limits::auth_message(&nonce_bytes));
     let auth = AuthFrame {
         node_pubkey: node_key.pubkey_base58(),
         wallet_pubkey: wallet_pubkey.to_string(),
@@ -204,7 +229,7 @@ pub async fn serve(
                         if let Some(ServerFrame::Job { job_id, body }) = ServerFrame::parse(&txt) {
                             // Forward + stream back. A send failure means the
                             // socket died → reconnect.
-                            if !handle_job(&mut ws, client, &upstream_url, &job_id, body).await {
+                            if !handle_job(&mut ws, client, &upstream_url, &config.model, &job_id, body).await {
                                 return SessionOutcome::Disconnected;
                             }
                         }
@@ -229,14 +254,40 @@ async fn handle_job(
     ws: &mut GatewaySocket,
     client: &reqwest::Client,
     upstream_url: &str,
+    model: &str,
     job_id: &str,
-    mut body: serde_json::Value,
+    body: serde_json::Value,
 ) -> bool {
-    // Force streaming so we get SSE deltas regardless of the request body.
-    if let serde_json::Value::Object(ref mut map) = body {
-        map.insert("stream".to_string(), serde_json::Value::Bool(true));
+    // NX-3: the gateway body is untrusted input to the LOCAL model. Pin
+    // the served model, clamp max_tokens, drop unexpected keys, force
+    // stream. NX-4: bound the whole job by wall-clock time.
+    let body = limits::sanitize_job_body(body, model);
+    match tokio::time::timeout(
+        limits::JOB_TIMEOUT,
+        stream_job(ws, client, upstream_url, job_id, body),
+    )
+    .await
+    {
+        Ok(socket_alive) => socket_alive,
+        Err(_) => {
+            // Job exceeded the time budget — tell the gateway and keep the
+            // session alive for the next job.
+            send_text(ws, job_error_frame(job_id, "job exceeded time limit")).await
+        }
     }
+}
 
+/// Inner job runner (wrapped in a timeout by [`handle_job`]). POSTs the
+/// sanitized body to the upstream, parses the SSE stream, and forwards
+/// `chunk`/`done`/`job_error`. Returns `false` if writing back to the
+/// gateway failed (socket dead → caller reconnects).
+async fn stream_job(
+    ws: &mut GatewaySocket,
+    client: &reqwest::Client,
+    upstream_url: &str,
+    job_id: &str,
+    body: serde_json::Value,
+) -> bool {
     let resp = match client.post(upstream_url).json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -257,6 +308,8 @@ async fn handle_job(
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut final_usage: Option<serde_json::Value> = None;
+    // NX-4: cap total bytes streamed back for one job.
+    let mut total_out: usize = 0;
 
     loop {
         let chunk = match stream.next().await {
@@ -269,6 +322,12 @@ async fn handle_job(
         };
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
+        // NX-4: a newline-less flood never drains via `find('\n')`; if the
+        // buffer balloons past the cap, treat the upstream as broken/hostile.
+        if buf.len() > limits::MAX_SSE_BUFFER_BYTES {
+            return send_text(ws, job_error_frame(job_id, "upstream produced an oversized line")).await;
+        }
+
         // Drain complete lines from the buffer.
         while let Some(nl) = buf.find('\n') {
             let line: String = buf.drain(..=nl).collect();
@@ -278,10 +337,19 @@ async fn handle_job(
             }
             match protocol::parse_sse_line(line) {
                 Some(SseEvent::Delta(delta)) => {
-                    if !delta.is_empty()
-                        && !send_text(ws, chunk_frame(job_id, &delta)).await
-                    {
-                        return false;
+                    if !delta.is_empty() {
+                        total_out = total_out.saturating_add(delta.len());
+                        // NX-4: stop a runaway generation from streaming forever.
+                        if total_out > limits::MAX_JOB_OUTPUT_BYTES {
+                            return send_text(
+                                ws,
+                                job_error_frame(job_id, "job exceeded output size limit"),
+                            )
+                            .await;
+                        }
+                        if !send_text(ws, chunk_frame(job_id, &delta)).await {
+                            return false;
+                        }
                     }
                 }
                 Some(SseEvent::Usage(u)) => final_usage = Some(u),
@@ -331,5 +399,20 @@ mod tests {
         let first = next_backoff(None);
         let second = next_backoff(Some(first));
         assert!(second > first, "second backoff {second:?} must exceed first {first:?}");
+    }
+
+    #[test]
+    fn jitter_stays_in_band_and_varies() {
+        // NX-6: jitter lands within ±25% of the base, and isn't constant.
+        let base = Duration::from_secs(8);
+        let lo = base.mul_f64(0.75);
+        let hi = base.mul_f64(1.25);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let j = jittered(base);
+            assert!(j >= lo && j <= hi, "jittered {j:?} out of band [{lo:?},{hi:?}]");
+            seen.insert(j.as_millis());
+        }
+        assert!(seen.len() > 1, "jitter should produce varied delays, got {seen:?}");
     }
 }
