@@ -20,7 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Key-custody binary: fail CI on any advisory in the dep graph (NX-12).
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      # cargo audit (not the rustsec action) so the documented
+      # accept-list in audit.toml is honored. New advisories outside
+      # that file still fail CI (NX-12).
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
