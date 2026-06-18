@@ -12,6 +12,20 @@ fn bin() -> Command {
 }
 
 #[test]
+fn no_subcommand_prints_quickstart_and_succeeds() {
+    // Double-clicking the .exe runs it with no subcommand. That must NOT be a
+    // clap error (which on Windows flashes a transient console and vanishes);
+    // it shows a readable quick-start and exits 0. The Windows "press Enter"
+    // pause only fires on an actual double-click, never from a shell, so this
+    // subprocess test neither blocks nor pauses.
+    bin()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nexus-client init"))
+        .stdout(predicate::str::contains("nexus-client start"));
+}
+
+#[test]
 fn init_creates_files_and_prints_pubkeys() {
     let dir = tempdir().unwrap();
     let path = dir.path();

@@ -30,7 +30,7 @@ fn default_dir() -> PathBuf {
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -68,23 +68,91 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Init { dir, model, wallet } => {
+    let code = match cli.command {
+        Some(Command::Init { dir, model, wallet }) => {
             let dir = dir.unwrap_or_else(default_dir);
             cmd_init(dir, model, wallet)
         }
-        Command::Status { dir } => {
+        Some(Command::Status { dir }) => {
             let dir = dir.unwrap_or_else(default_dir);
             cmd_status(dir)
         }
-        Command::Start { dir } => {
+        Some(Command::Start { dir }) => {
             let dir = dir.unwrap_or_else(default_dir);
             cmd_start(dir)
         }
-        Command::Earnings { dir } => {
+        Some(Command::Earnings { dir }) => {
             let dir = dir.unwrap_or_else(default_dir);
             cmd_earnings(dir)
         }
+        // No subcommand — the usual result of DOUBLE-CLICKING the .exe on
+        // Windows. Without this, clap exits with a terse "requires a
+        // subcommand" error and Explorer's transient console closes
+        // instantly (the "console flashes and disappears" report). Show a
+        // readable quick-start instead; `pause_if_double_click` below then
+        // keeps the window open so it can actually be read.
+        None => welcome(),
+    };
+    // Any double-click exit path (welcome, init result, an error) would
+    // otherwise vanish before it could be read — hold the window open.
+    pause_if_double_click();
+    code
+}
+
+/// Quick-start shown when the binary runs with no subcommand — the typical
+/// result of double-clicking the `.exe` on Windows.
+fn welcome() -> ExitCode {
+    println!("Nexus Client — attach your LLM to the GNN compute network and earn GNN.");
+    println!();
+    println!("This is a command-line tool. Open a terminal (on Windows: PowerShell)");
+    println!("and run:");
+    println!();
+    println!("  nexus-client init      one-time setup — creates your node key + wallet");
+    println!("  nexus-client status    show your model + gateway + node id");
+    println!("  nexus-client start     connect to the gateway and start serving jobs");
+    println!("  nexus-client earnings  show your GNN earnings");
+    println!();
+    println!("Before `start`: run a local LLM (Ollama/vLLM at http://localhost:11434/v1)");
+    println!("and stake GNN for your node's wallet so the gateway accepts it.");
+    println!();
+    println!("Tip (Windows): Shift+Right-click this folder -> \"Open PowerShell window");
+    println!("here\", then type a command above. Run `nexus-client --help` for all options.");
+    ExitCode::SUCCESS
+}
+
+/// Whether this process was launched by double-clicking in a GUI file manager
+/// (Windows Explorer), which spawns a *transient* console that closes the
+/// instant the process exits. Detected via the number of processes attached
+/// to the console: exactly one means we own a fresh console (double-click);
+/// running from an existing shell attaches at least the shell too.
+#[cfg(windows)]
+fn launched_by_double_click() -> bool {
+    // kernel32!GetConsoleProcessList returns the count of processes sharing
+    // this console. <= 1 ⇒ launched by double-click.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleProcessList(lpdw_process_list: *mut u32, dw_process_count: u32) -> u32;
+    }
+    let mut buf = [0u32; 2];
+    let count = unsafe { GetConsoleProcessList(buf.as_mut_ptr(), buf.len() as u32) };
+    count <= 1
+}
+
+#[cfg(not(windows))]
+fn launched_by_double_click() -> bool {
+    false
+}
+
+/// On a Windows double-click, wait for Enter before exiting so the console
+/// window doesn't vanish before the user can read it. No-op when run from a
+/// terminal (so shell usage isn't interrupted) and on non-Windows platforms.
+fn pause_if_double_click() {
+    if launched_by_double_click() {
+        use std::io::Write;
+        print!("\nPress Enter to close this window . . . ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
     }
 }
 
