@@ -1,0 +1,13 @@
+# Statically link the MSVC C runtime on Windows so the released
+# nexus-client.exe is fully self-contained.
+#
+# Without this, the .exe dynamically imports VCRUNTIME140.dll (the Visual C++
+# Redistributable), which is NOT present on a clean Windows install. A user
+# who lacks the redist gets STATUS_DLL_NOT_FOUND (0xc0000135) at launch — the
+# process dies before printing anything, so a double-clicked window just
+# "flashes and disappears." Statically linking the CRT removes that dependency
+# (verified: `dumpbin /dependents` no longer lists VCRUNTIME140.dll).
+#
+# Scoped to the windows-msvc target only; macOS / Linux builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
