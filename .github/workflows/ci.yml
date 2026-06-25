@@ -34,13 +34,22 @@ jobs:
       - name: Assert statically linked (no glibc floor)
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/nexus-client
-          file "$BIN"
-          if ! file "$BIN" | grep -q "statically linked"; then
-            echo "::error::nexus-client musl binary is NOT statically linked — it would carry a glibc floor"
+          DESC=$(file "$BIN")
+          echo "$DESC"
+          # Rust links musl release binaries as static-pie by default. Both
+          # "statically linked" and "static-pie linked" mean self-contained —
+          # no glibc, no external .so, no version floor.
+          if ! echo "$DESC" | grep -qE "statically linked|static-pie linked"; then
+            echo "::error::nexus-client musl binary is NOT static — it would carry a glibc floor"
             exit 1
           fi
-          ldd "$BIN" || true   # static binary => "not a dynamic executable"
-          echo "OK: static musl binary — runs on any x86-64 Linux."
+          # Belt-and-suspenders: there must be no GLIBC-versioned symbol needs.
+          if command -v objdump >/dev/null && objdump -T "$BIN" 2>/dev/null | grep -q "GLIBC_"; then
+            echo "::error::musl binary references GLIBC_ symbols — not truly glibc-free"
+            exit 1
+          fi
+          ldd "$BIN" 2>&1 || true   # expect "not a dynamic executable" / "statically linked"
+          echo "OK: static (static-pie) musl binary — no glibc floor, runs on any x86-64 Linux."
 
   audit:
     runs-on: ubuntu-22.04
