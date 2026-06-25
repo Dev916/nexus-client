@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "assert_cmd",
  "bs58",
