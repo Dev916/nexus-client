@@ -21,8 +21,12 @@ jobs:
           - os: macos-14
             target: x86_64-apple-darwin
             asset: nexus-client-macos-x64
+          # Static musl build → no glibc version floor, so the binary runs on
+          # ANY x86-64 Linux (old distros, Alpine, containers), not just glibc
+          # >= 2.34. Mirrors the Windows static-CRT fix: a clean box can't fail
+          # to launch the binary for lack of a system runtime.
           - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             asset: nexus-client-linux-x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -34,6 +38,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # ring (the rustls crypto backend) compiles C, so the musl target needs
+      # the musl C toolchain (musl-gcc).
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Stage asset (unix)

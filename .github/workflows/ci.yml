@@ -15,6 +15,33 @@ jobs:
       - run: cargo test
       - run: cargo clippy -- -D warnings
 
+  # Build the release Linux target (static musl) and prove it has NO glibc
+  # version floor — i.e. it will run on any x86-64 Linux, not just the runner's
+  # glibc. Guards against silently regressing back to a glibc-linked binary.
+  linux-musl:
+    name: linux static (musl) build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (musl, static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Assert statically linked (no glibc floor)
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/nexus-client
+          file "$BIN"
+          if ! file "$BIN" | grep -q "statically linked"; then
+            echo "::error::nexus-client musl binary is NOT statically linked — it would carry a glibc floor"
+            exit 1
+          fi
+          ldd "$BIN" || true   # static binary => "not a dynamic executable"
+          echo "OK: static musl binary — runs on any x86-64 Linux."
+
   audit:
     runs-on: ubuntu-22.04
     steps:
