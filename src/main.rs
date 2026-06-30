@@ -11,9 +11,24 @@ use clap::{Parser, Subcommand};
 
 use nexus_client::config::{self, Config};
 use nexus_client::keys::{
-    NodeKey, generate_wallet, load_wallet_pubkey, node_key_exists, save_wallet,
+    NodeKey, generate_wallet, import_wallet_from, load_wallet, load_wallet_pubkey, node_key_exists,
+    save_wallet,
 };
 use nexus_client::run::{self, SessionOutcome};
+use nexus_client::solana_stake::{Rpc, build_signed_stake_tx};
+use nexus_client::wallet_auth::get_wallet_jwt;
+
+/// Public Solana RPC for `getTokenAccountsByOwner` / `sendTransaction` when
+/// `--rpc` is omitted. Picked from the gateway's reported network so the CLI
+/// never needs the server's (secret) Helius key. Devnet uses the devnet
+/// endpoint; anything else falls back to mainnet-beta's public endpoint.
+fn default_rpc_for(network: &str) -> &'static str {
+    if network == "devnet" {
+        "https://api.devnet.solana.com"
+    } else {
+        "https://api.mainnet-beta.solana.com"
+    }
+}
 
 /// Default client directory (`~/.nexus-client`) when `--dir` is omitted.
 fn default_dir() -> PathBuf {
@@ -43,7 +58,9 @@ enum Command {
         /// Model this node will serve.
         #[arg(long, default_value = config::DEFAULT_MODEL)]
         model: String,
-        /// Wallet source: `new` to generate one (only `new` supported in T5).
+        /// Wallet source: `new` (default) generates a fresh keypair, or
+        /// import a funded wallet by passing a path to a solana-keygen
+        /// 64-byte JSON keypair file, or a base58-encoded 64-byte secret.
         #[arg(long, default_value = "new")]
         wallet: String,
     },
@@ -61,6 +78,23 @@ enum Command {
     /// Show earnings for this node — GETs the gateway's earnings endpoint
     /// for this node's pubkey and prints lifetime / unpaid GNN + last payout.
     Earnings {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Stake GNN for this node: send an on-chain GNN transfer to the
+    /// gateway's treasury, then record it so `start` is accepted. The chain
+    /// addresses + network come from the gateway's `/api/compute/config`;
+    /// only the RPC endpoint is client-chosen (`--rpc`, else a public
+    /// default for the gateway's network).
+    Stake {
+        /// Amount of GNN to stake (e.g. `1.5`). 1 GNN = 1_000_000 micros.
+        #[arg(long)]
+        amount: f64,
+        /// Solana JSON-RPC endpoint. Defaults to the public RPC for the
+        /// gateway's network (devnet: https://api.devnet.solana.com).
+        #[arg(long)]
+        rpc: Option<String>,
+        /// Client directory (default: ~/.nexus-client).
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -84,6 +118,10 @@ fn main() -> ExitCode {
         Some(Command::Earnings { dir }) => {
             let dir = dir.unwrap_or_else(default_dir);
             cmd_earnings(dir)
+        }
+        Some(Command::Stake { amount, rpc, dir }) => {
+            let dir = dir.unwrap_or_else(default_dir);
+            cmd_stake(dir, amount, rpc)
         }
         // No subcommand — the usual result of DOUBLE-CLICKING the .exe on
         // Windows. Without this, clap exits with a terse "requires a
@@ -164,11 +202,19 @@ fn fmt_gnn(micros: i64) -> String {
     format!("{whole}.{frac:06}")
 }
 
-/// `earnings`: load config + node key from the client dir, derive the
-/// gateway's HTTP origin from its WS URL, GET
-/// `/api/compute/nodes/{node_pubkey}/earnings`, and pretty-print lifetime /
-/// unpaid GNN plus the last payout line. Refuses an uninitialized dir
-/// (exit 1) and exits 1 on a network / non-2xx error.
+/// Build the authenticated earnings GET request: the `/.../earnings` endpoint
+/// requires a wallet JWT, attached as `Authorization: Bearer <jwt>`. Factored
+/// out so the header construction is unit-testable without a live server.
+fn earnings_request(client: &reqwest::Client, url: &str, jwt: &str) -> reqwest::RequestBuilder {
+    client.get(url).bearer_auth(jwt)
+}
+
+/// `earnings`: load config + node key + wallet from the client dir, derive the
+/// gateway's HTTP origin from its WS URL, acquire a wallet JWT (SIWS), GET
+/// `/api/compute/nodes/{node_pubkey}/earnings` with `Authorization: Bearer
+/// <jwt>`, and pretty-print lifetime / unpaid GNN plus the last payout line.
+/// Refuses an uninitialized dir (exit 1) and exits 1 on a JWT-acquire /
+/// network / non-2xx error.
 fn cmd_earnings(dir: PathBuf) -> ExitCode {
     if !node_key_exists(&dir) {
         eprintln!("not initialized: {} (run `nexus-client init`)", dir.display());
@@ -188,6 +234,13 @@ fn cmd_earnings(dir: PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let wallet = match load_wallet(&dir) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("failed to read wallet: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let origin = cfg.gateway_http_origin();
     let url = format!("{origin}/api/compute/nodes/{node_pubkey}/earnings");
@@ -201,9 +254,11 @@ fn cmd_earnings(dir: PathBuf) -> ExitCode {
     };
 
     let result: Result<serde_json::Value, String> = runtime.block_on(async {
+        // The earnings endpoint requires a wallet JWT (SIWS) — authenticate with
+        // the wallet key before issuing the GET.
+        let jwt = get_wallet_jwt(&origin, &wallet).await?;
         let client = reqwest::Client::new();
-        let resp = client
-            .get(&url)
+        let resp = earnings_request(&client, &url, &jwt)
             .send()
             .await
             .map_err(|e| format!("request to {url} failed: {e}"))?;
@@ -244,6 +299,187 @@ fn cmd_earnings(dir: PathBuf) -> ExitCode {
             );
         }
         _ => println!("last payout: none"),
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// `stake`: send an on-chain GNN transfer to the gateway's treasury and
+/// record it so this node passes `start`'s stake gate.
+///
+/// Flow (mirrors the spec's Component 3 / data flow):
+///   1. Load the wallet keypair + node pubkey + config from `dir`; derive the
+///      gateway HTTP origin.
+///   2. `GET {origin}/api/compute/config` → `{gnn_mint, treasury,
+///      min_stake_micros, network}` (single source of truth for addresses +
+///      network — never hardcoded, never the server's secret RPC).
+///   3. Pick the RPC: `--rpc` if given, else the public default for the
+///      gateway's network.
+///   4. Check the wallet's GNN balance; refuse BEFORE sending a tx if it's
+///      short, printing the funding hint.
+///   5. Build + sign `transfer_checked` against a fresh blockhash; send; poll
+///      to `finalized`.
+///   6. Acquire the wallet JWT (SIWS) and `POST {origin}/api/compute/stake`
+///      `{node_pubkey, tx_signature, amount_micros}` with `Bearer`.
+///   7. Print the new staked total + whether it meets the minimum.
+///
+/// Refuses an uninitialized dir (exit 1). Any network / on-chain / non-2xx
+/// failure exits 1. A non-positive `--amount` is rejected up front.
+fn cmd_stake(dir: PathBuf, amount: f64, rpc: Option<String>) -> ExitCode {
+    use solana_signer::Signer;
+
+    if !node_key_exists(&dir) {
+        eprintln!("not initialized: {} (run `nexus-client init`)", dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    // Reject a non-positive (or NaN) amount before touching the chain.
+    // `partial_cmp` yields `None` for NaN, so the `Some(Greater)` match also
+    // rejects NaN without the clippy-flagged `!(amount > 0.0)` form.
+    if !matches!(amount.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+        eprintln!("stake: --amount must be greater than 0 (got {amount})");
+        return ExitCode::FAILURE;
+    }
+    // GNN has 6 decimals: 1 GNN = 1_000_000 micros. Round to the nearest
+    // micro so float imprecision (e.g. 1.5 → 1499999.999…) doesn't truncate.
+    let amount_micros = (amount * 1_000_000.0).round() as i64;
+    if amount_micros <= 0 {
+        eprintln!("stake: --amount rounds to 0 micros (got {amount})");
+        return ExitCode::FAILURE;
+    }
+    let amount_raw = amount_micros as u64;
+
+    let cfg = match Config::load(&dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to read config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let node_pubkey = match NodeKey::load(&dir) {
+        Ok(k) => k.pubkey_base58(),
+        Err(e) => {
+            eprintln!("failed to read node key: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let wallet = match load_wallet(&dir) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("failed to read wallet: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let wallet_pubkey = wallet.pubkey().to_string();
+    let origin = cfg.gateway_http_origin();
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result: Result<serde_json::Value, String> = runtime.block_on(async {
+        // 1. Fetch chain config from the gateway (addresses + network).
+        let cfg_url = format!("{origin}/api/compute/config");
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&cfg_url)
+            .send()
+            .await
+            .map_err(|e| format!("request to {cfg_url} failed: {e}"))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("reading {cfg_url} body failed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("gateway returned {status} for {cfg_url}: {body}"));
+        }
+        let chain: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("invalid JSON from {cfg_url}: {e} (body: {body})"))?;
+        let gnn_mint = chain["gnn_mint"]
+            .as_str()
+            .ok_or_else(|| "config: missing gnn_mint".to_string())?
+            .to_string();
+        let treasury = chain["treasury"]
+            .as_str()
+            .ok_or_else(|| "config: missing treasury".to_string())?
+            .to_string();
+        let network = chain["network"].as_str().unwrap_or("mainnet").to_string();
+
+        // 2. Pick the RPC endpoint (never the server's secret Helius key).
+        let rpc_url = rpc
+            .clone()
+            .unwrap_or_else(|| default_rpc_for(&network).to_string());
+        let rpc_client = Rpc::new(rpc_url);
+
+        // 3. Balance gate — refuse BEFORE sending any tx if short.
+        let balance = rpc_client.get_gnn_balance(&wallet_pubkey, &gnn_mint).await?;
+        if balance < amount_raw {
+            return Err(format!(
+                "insufficient GNN: have {balance}, need {amount_raw}; fund {wallet_pubkey}"
+            ));
+        }
+
+        // 4. Build + sign + send the GNN transfer, then confirm finalized.
+        let blockhash = rpc_client.get_latest_blockhash().await?;
+        let signed_b64 =
+            build_signed_stake_tx(&wallet, &gnn_mint, &treasury, amount_raw, &blockhash)?;
+        let tx_signature = rpc_client.send_transaction(&signed_b64).await?;
+        println!("submitted stake tx {tx_signature}; awaiting finalization…");
+        rpc_client.confirm_finalized(&tx_signature).await?;
+
+        // 5. Authenticate with the wallet key and record the stake.
+        let jwt = get_wallet_jwt(&origin, &wallet).await?;
+        let stake_url = format!("{origin}/api/compute/stake");
+        let stake_body = serde_json::json!({
+            "node_pubkey": node_pubkey,
+            "tx_signature": tx_signature,
+            "amount_micros": amount_micros,
+        });
+        let resp = client
+            .post(&stake_url)
+            .bearer_auth(&jwt)
+            .json(&stake_body)
+            .send()
+            .await
+            .map_err(|e| format!("request to {stake_url} failed: {e}"))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("reading {stake_url} body failed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("gateway returned {status} for {stake_url}: {body}"));
+        }
+        serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| format!("invalid JSON from {stake_url}: {e} (body: {body})"))
+    });
+
+    let staked = match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("stake: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let staked_micros = staked["staked_micros"].as_i64().unwrap_or(0);
+    let meets_minimum = staked["meets_minimum"].as_bool().unwrap_or(false);
+
+    println!("node:    {node_pubkey}");
+    println!("staked:  {} GNN total", fmt_gnn(staked_micros));
+    if meets_minimum {
+        println!("status:  meets the minimum stake — run `nexus-client start`");
+    } else {
+        let min = staked["min_stake_micros"].as_i64().unwrap_or(0);
+        println!(
+            "status:  below the minimum stake ({} GNN) — stake more before `nexus-client start`",
+            fmt_gnn(min)
+        );
     }
 
     ExitCode::SUCCESS
@@ -315,10 +551,20 @@ fn cmd_init(dir: PathBuf, model: String, wallet: String) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if wallet != "new" {
-        eprintln!("--wallet: only `new` is supported in this version (got `{wallet}`)");
-        return ExitCode::FAILURE;
-    }
+    // Resolve the wallet up front so an unparseable `--wallet` import fails
+    // before we create any on-disk state. `new` (default) generates a fresh
+    // keypair; anything else is a path-or-base58 import of a funded wallet.
+    let wallet_kp = if wallet == "new" {
+        generate_wallet()
+    } else {
+        match import_wallet_from(&wallet) {
+            Ok(kp) => kp,
+            Err(e) => {
+                eprintln!("--wallet: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
 
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("failed to create dir {}: {e}", dir.display());
@@ -333,8 +579,7 @@ fn cmd_init(dir: PathBuf, model: String, wallet: String) -> ExitCode {
     }
     let node_pubkey = node_key.pubkey_base58();
 
-    // Solana wallet.
-    let wallet_kp = generate_wallet();
+    // Solana wallet (generated or imported above).
     if let Err(e) = save_wallet(&wallet_kp, &dir) {
         eprintln!("failed to write wallet: {e}");
         return ExitCode::FAILURE;
@@ -387,4 +632,33 @@ fn cmd_status(dir: PathBuf) -> ExitCode {
     println!("gateway:  {}", cfg.gateway);
     println!("node:     {node_pubkey}");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The earnings GET must carry the wallet JWT as `Authorization: Bearer
+    /// <jwt>` — the endpoint rejects unauthenticated requests. Build the request
+    /// and assert the header is present and exactly right.
+    #[test]
+    fn earnings_request_sets_bearer_auth() {
+        let client = reqwest::Client::new();
+        let req = earnings_request(
+            &client,
+            "https://nexus.ghostnn.ai/api/compute/nodes/NODE/earnings",
+            "test.jwt.token",
+        )
+        .build()
+        .expect("request builds");
+
+        let auth = req
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("Authorization header is set")
+            .to_str()
+            .expect("header is valid ascii");
+        assert_eq!(auth, "Bearer test.jwt.token");
+        assert_eq!(req.method(), reqwest::Method::GET);
+    }
 }

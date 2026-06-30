@@ -1,6 +1,6 @@
 [package]
 name = "nexus-client"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.93"
 description = "Lend your GPU to the Nexus compute network and earn GNN. Wraps a local OpenAI-compatible inference server (Ollama, vLLM, llama.cpp) and serves metered jobs."
@@ -22,6 +22,22 @@ ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
 bs58 = "0.5"
 solana-keypair = "2"
 solana-signer = "2"
+# Slim SPL/Solana stack for building + signing the GNN stake transfer_checked tx
+# (the `stake` subcommand). All openssl-free + static-build-safe.
+# solana-transaction MUST stay default-features=false so the
+# `precompiles -> secp256r1 -> openssl` chain is never pulled. NEVER add
+# solana-sdk / solana-client / solana-rpc-client here — they drag in openssl-sys
+# and break the static Windows/Linux release builds.
+spl-token = { version = "7", default-features = false }
+spl-associated-token-account = { version = "6", default-features = false }
+solana-program = "2"
+solana-instruction = "2"
+solana-message = { version = "2", features = ["bincode"] }
+solana-transaction = { version = "2", default-features = false, features = ["bincode"] }
+solana-system-interface = "1"
+solana-hash = "2"
+bincode = "1"
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

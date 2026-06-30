@@ -43,20 +43,27 @@ your GPU ── Ollama / vLLM / llama.cpp (any OpenAI-compatible server)
 ## Quickstart
 
 ```sh
-# 1. Run a local model (example: Ollama + Hermes 3)
-ollama pull hermes3
+# 1. Pull an eligible model with Ollama. The served model name must match
+#    the --model you pass to init exactly.
+ollama pull llama3.2
 
-# 2. Initialize — creates node key + Solana wallet + config
-nexus-client init
+# 2. Initialize — creates the node key + config. Import a GNN-funded wallet
+#    (path to a solana-keygen JSON file or a base58 64-byte secret), or omit
+#    --wallet to generate a fresh one and fund the printed address.
+nexus-client init --model llama3.2 --wallet import ./wallet.json
 
-# 3. Stake (devnet GNN during the pilot) — see ghostnn.ai/nexus-client
+# 3. Stake GNN on-chain to the network treasury (mainnet — 1 GNN minimum).
+#    This sends the transfer and records it so the gateway accepts your node.
+nexus-client stake --amount 1
 
-# 4. Start serving
+# 4. Start serving inference jobs and earning
 nexus-client start
 
-# Check earnings any time
+# Check earnings any time (needs the wallet that owns the node)
 nexus-client earnings
 ```
+
+Full step-by-step guide with diagrams: https://ghostnn.ai/nexus-client/docs
 
 Config lives at `~/.nexus-client/config.toml`:
 

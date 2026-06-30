@@ -11,3 +11,5 @@ pub mod keys;
 pub mod limits;
 pub mod protocol;
 pub mod run;
+pub mod solana_stake;
+pub mod wallet_auth;

@@ -145,6 +145,70 @@ pub fn save_wallet(wallet: &Keypair, dir: &Path) -> io::Result<()> {
     write_new_secure(&path, json.as_bytes())
 }
 
+/// Import a funded Solana wallet from `spec`, accepting either:
+///   * a **path** to a `solana-keygen` 64-byte JSON-array file (same format
+///     [`save_wallet`] writes / [`load_wallet_pubkey`] reads), or
+///   * a **base58-encoded** 64-byte secret key string.
+///
+/// Path detection mirrors the saver: if `spec` names an existing file we
+/// parse it as the JSON array; otherwise it's treated as base58. Both paths
+/// validate the decoded length (exactly 64 bytes) and surface a clear error
+/// on failure. The transient secret buffer is zeroized after the `Keypair`
+/// is built (NX-7).
+pub fn import_wallet_from(spec: &str) -> Result<Keypair, String> {
+    let mut bytes: Zeroizing<Vec<u8>> = if Path::new(spec).exists() {
+        // solana-keygen 64-byte JSON array — same format load_wallet_pubkey reads.
+        let json = Zeroizing::new(
+            fs::read_to_string(spec).map_err(|e| format!("failed to read {spec}: {e}"))?,
+        );
+        Zeroizing::new(
+            serde_json::from_str::<Vec<u8>>(&json)
+                .map_err(|e| format!("{spec} is not a 64-byte JSON keypair array: {e}"))?,
+        )
+    } else {
+        // base58-encoded 64-byte secret key.
+        Zeroizing::new(
+            bs58::decode(spec)
+                .into_vec()
+                .map_err(|e| format!("--wallet `{spec}` is neither an existing file nor valid base58: {e}"))?,
+        )
+    };
+
+    if bytes.len() != 64 {
+        return Err(format!(
+            "wallet key must decode to exactly 64 bytes (got {})",
+            bytes.len()
+        ));
+    }
+
+    let keypair = Keypair::try_from(&bytes[..])
+        .map_err(|e| format!("invalid 64-byte Solana keypair: {e}"))?;
+    bytes.zeroize();
+    Ok(keypair)
+}
+
+/// Load the full Solana wallet [`Keypair`] from `<dir>/wallet.json` (the
+/// 64-byte JSON-array solana-tooling format). Needed by `stake` to sign the
+/// on-chain GNN transfer and the SIWS auth message; `load_wallet_pubkey`
+/// covers the pubkey-only case. The transient secret buffer is zeroized
+/// after the `Keypair` is constructed (NX-7); the caller owns the returned
+/// `Keypair`, whose own `Drop` zeroizes its secret.
+pub fn load_wallet(dir: &Path) -> io::Result<Keypair> {
+    let path = dir.join(WALLET_FILE);
+    let json = Zeroizing::new(fs::read_to_string(&path)?);
+    let mut bytes = Zeroizing::new(serde_json::from_str::<Vec<u8>>(&json)?);
+    if bytes.len() != 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wallet.json must be a 64-byte array",
+        ));
+    }
+    let wallet = Keypair::try_from(&bytes[..])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    bytes.zeroize();
+    Ok(wallet)
+}
+
 /// Read the wallet pubkey (base58) from `<dir>/wallet.json`. The secret
 /// bytes loaded only to derive the pubkey are zeroized (NX-7).
 pub fn load_wallet_pubkey(dir: &Path) -> io::Result<String> {
