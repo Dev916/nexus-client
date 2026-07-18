@@ -13,3 +13,9 @@ pub mod protocol;
 pub mod run;
 pub mod solana_stake;
 pub mod wallet_auth;
+/// gnn-z8hl.3 (Task 5) — the AgenC provider loop (`nexus-client work`):
+/// discover → evaluate (`should_claim`) → drive a delegated Builder session →
+/// settle on-chain via `agenc_worker::worker_roundtrip`. Exposed as a library
+/// module so the loop body (`work_once`) + the pure claim decision are
+/// unit/integration-tested against a mock Nexus + a scripted MCP.
+pub mod work;

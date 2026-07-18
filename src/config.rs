@@ -21,6 +21,22 @@ pub const DEFAULT_GATEWAY: &str = "wss://nexus.ghostnn.ai/api/compute/node";
 /// Filename of the client config under the client dir.
 pub const CONFIG_FILE: &str = "config.toml";
 
+// ── AgenC provider-loop (`nexus-client work`) defaults ──────────────────────
+
+/// Default keyless AgenC sidecar (agenc-bridge) base URL — the `/build-*-tx`
+/// endpoints. The bridge's own default listen port is 8799 (see agenc-bridge
+/// config.ts). Overridable per host.
+pub const DEFAULT_BUILD_API_URL: &str = "http://127.0.0.1:8799";
+/// Default Solana JSON-RPC for the `work` loop's claim/submit broadcasts. The
+/// public mainnet endpoint — never the server's secret Helius key.
+pub const DEFAULT_AGENC_RPC: &str = "https://api.mainnet-beta.solana.com";
+/// Default reward floor (lamports) below which a discovered job is skipped —
+/// mirrors the server's `MIN_REWARD_LAMPORTS` (1_000_000 = 0.001 SOL).
+pub const DEFAULT_MIN_REWARD_LAMPORTS: u64 = 1_000_000;
+/// Default `nexus-city-mcp` binary name the loop spawns to drive the delegated
+/// Builder session (resolved on `PATH` unless an absolute path is configured).
+pub const DEFAULT_MCP_BIN: &str = "nexus-city-mcp";
+
 /// On-disk client config. All fields default to the spec values when a
 /// key is absent, so partial configs still load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +47,33 @@ pub struct Config {
     pub upstream: String,
     #[serde(default = "default_gateway")]
     pub gateway: String,
+    /// AgenC provider-loop knobs (`nexus-client work`). A nested `[agenc]`
+    /// table; entirely defaulted so pre-`work` configs still load unchanged.
+    /// Serialized LAST so the scalar fields above stay above the table (TOML
+    /// requires tables after bare keys).
+    #[serde(default)]
+    pub agenc: AgencConfig,
+}
+
+/// AgenC provider-loop configuration (`nexus-client work`): where to fetch the
+/// keyless unsigned txs, which RPC to broadcast on, the reward floor, this
+/// agent's advertised endpoint, and the MCP binary to spawn. Discovery
+/// (`GET /api/agenc/jobs`) and the delegated Builder MCP both target the
+/// gateway's HTTP origin, so no URL for them is stored here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgencConfig {
+    #[serde(default = "default_build_api_url")]
+    pub build_api_url: String,
+    #[serde(default = "default_agenc_rpc")]
+    pub rpc_url: String,
+    #[serde(default = "default_min_reward_lamports")]
+    pub min_reward_lamports: u64,
+    /// This agent's advertised inference endpoint (recorded on register). Empty
+    /// by default — a pure-provider node needs no inbound endpoint.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default = "default_mcp_bin")]
+    pub mcp_bin: String,
 }
 
 fn default_model() -> String {
@@ -42,6 +85,30 @@ fn default_upstream() -> String {
 fn default_gateway() -> String {
     DEFAULT_GATEWAY.to_string()
 }
+fn default_build_api_url() -> String {
+    DEFAULT_BUILD_API_URL.to_string()
+}
+fn default_agenc_rpc() -> String {
+    DEFAULT_AGENC_RPC.to_string()
+}
+fn default_min_reward_lamports() -> u64 {
+    DEFAULT_MIN_REWARD_LAMPORTS
+}
+fn default_mcp_bin() -> String {
+    DEFAULT_MCP_BIN.to_string()
+}
+
+impl Default for AgencConfig {
+    fn default() -> Self {
+        Self {
+            build_api_url: default_build_api_url(),
+            rpc_url: default_agenc_rpc(),
+            min_reward_lamports: default_min_reward_lamports(),
+            endpoint: String::new(),
+            mcp_bin: default_mcp_bin(),
+        }
+    }
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -49,6 +116,7 @@ impl Default for Config {
             model: default_model(),
             upstream: default_upstream(),
             gateway: default_gateway(),
+            agenc: AgencConfig::default(),
         }
     }
 }
@@ -155,6 +223,7 @@ mod tests {
             model: "kimi-k2".to_string(),
             upstream: "http://localhost:8000/v1".to_string(),
             gateway: "wss://example.test/api/compute/node".to_string(),
+            agenc: AgencConfig::default(),
         };
         let s = c.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();
@@ -174,6 +243,27 @@ mod tests {
         assert_eq!(back.model, "qwen-3");
         assert_eq!(back.upstream, DEFAULT_UPSTREAM);
         assert_eq!(back.gateway, DEFAULT_GATEWAY);
+    }
+
+    #[test]
+    fn agenc_block_defaults_and_partial_override() {
+        // A config with no [agenc] table yields the AgenC defaults.
+        let c = Config::from_toml("model = \"hermes-3\"\n").unwrap();
+        assert_eq!(c.agenc, AgencConfig::default());
+        assert_eq!(c.agenc.min_reward_lamports, 1_000_000);
+        assert_eq!(c.agenc.rpc_url, "https://api.mainnet-beta.solana.com");
+        assert_eq!(c.agenc.mcp_bin, "nexus-city-mcp");
+
+        // A partial [agenc] table overrides only the given keys.
+        let c = Config::from_toml(
+            "model = \"hermes-3\"\n[agenc]\nmin_reward_lamports = 7\nrpc_url = \"http://rpc.test\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.agenc.min_reward_lamports, 7);
+        assert_eq!(c.agenc.rpc_url, "http://rpc.test");
+        // Untouched keys keep their defaults.
+        assert_eq!(c.agenc.build_api_url, DEFAULT_BUILD_API_URL);
+        assert_eq!(c.agenc.mcp_bin, "nexus-city-mcp");
     }
 
     #[test]
@@ -222,6 +312,7 @@ mod tests {
             model: "hermes-3".into(),
             upstream: DEFAULT_UPSTREAM.into(),
             gateway: "ws://127.0.0.1:5555/api/compute/node".into(),
+            agenc: AgencConfig::default(),
         };
         assert_eq!(c.gateway_http_origin(), "http://127.0.0.1:5555");
     }

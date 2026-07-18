@@ -9,6 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use agenc_worker::builder::McpClient;
+
 use nexus_client::config::{self, Config};
 use nexus_client::keys::{
     NodeKey, generate_wallet, import_wallet_from, load_wallet, load_wallet_pubkey, node_key_exists,
@@ -17,6 +19,7 @@ use nexus_client::keys::{
 use nexus_client::run::{self, SessionOutcome};
 use nexus_client::solana_stake::{Rpc, build_signed_stake_tx};
 use nexus_client::wallet_auth::get_wallet_jwt;
+use nexus_client::work::{self, WorkCfg};
 
 /// Public Solana RPC for `getTokenAccountsByOwner` / `sendTransaction` when
 /// `--rpc` is omitted. Picked from the gateway's reported network so the CLI
@@ -98,6 +101,15 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Run the AgenC provider loop: register + bond, then discover jobs on the
+    /// Nexus board, evaluate each against your reward floor + margin, drive a
+    /// delegated Builder session for the best one, and settle it on-chain — all
+    /// with your node wallet. Reconnects with backoff; ctrl-c exits cleanly.
+    Work {
+        /// Client directory (default: ~/.nexus-client).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -122,6 +134,10 @@ fn main() -> ExitCode {
         Some(Command::Stake { amount, rpc, dir }) => {
             let dir = dir.unwrap_or_else(default_dir);
             cmd_stake(dir, amount, rpc)
+        }
+        Some(Command::Work { dir }) => {
+            let dir = dir.unwrap_or_else(default_dir);
+            cmd_work(dir)
         }
         // No subcommand — the usual result of DOUBLE-CLICKING the .exe on
         // Windows. Without this, clap exits with a terse "requires a
@@ -541,6 +557,101 @@ fn cmd_start(dir: PathBuf) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `work`: run the AgenC provider loop. Load the wallet + config, register +
+/// bond once (idempotent — an already-registered agent is fine), then a
+/// supervised loop: spawn a fresh MCP child, run one `work_once` (discover →
+/// evaluate → drive a delegated Builder session → settle on-chain), and on a
+/// transient error or an idle poll (`Ok(None)`) sleep `jittered(next_backoff)`
+/// before retrying. A successful claim resets the backoff. Races
+/// `tokio::signal::ctrl_c()` like `run.rs`, so a signal during a backoff sleep
+/// also exits cleanly (exit 0). Refuses an uninitialized dir (exit 1).
+fn cmd_work(dir: PathBuf) -> ExitCode {
+    if !node_key_exists(&dir) {
+        eprintln!("not initialized: {} (run `nexus-client init`)", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let cfg = match Config::load(&dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to read config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let wallet = match load_wallet(&dir) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("failed to read wallet: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let work_cfg = WorkCfg::from_config(&cfg);
+    let mcp_bin = cfg.agenc.mcp_bin.clone();
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "AgenC provider loop: board {} — reward floor {} lamports",
+        work_cfg.nexus_origin, work_cfg.min_reward_lamports
+    );
+
+    runtime.block_on(async move {
+        let http = reqwest::Client::new();
+
+        // Register + bond once. Idempotent: a re-register of an already-bonded
+        // agent fails at broadcast — log and continue into the loop.
+        if let Err(e) = work::register(&work_cfg, &wallet, &http).await {
+            eprintln!("register: {e} (continuing — the agent may already be registered)");
+        }
+
+        // Supervised loop with run.rs's backoff cadence, raced against ctrl-c.
+        let mut backoff: Option<std::time::Duration> = None;
+        loop {
+            // A fresh MCP child per iteration (dropped at end of scope → SIGKILL).
+            let outcome = match McpClient::spawn(&mcp_bin, &work_cfg.nexus_origin).await {
+                Ok(mut mcp) => work::work_once(&work_cfg, &wallet, &mut mcp, &http).await,
+                Err(e) => Err(e),
+            };
+
+            // Delay before the next iteration: none after a successful claim
+            // (poll promptly for more work, backoff reset), else jittered backoff.
+            let delay = match outcome {
+                Ok(Some(submit)) => {
+                    println!("submitted result for task {}", submit.task_pda);
+                    backoff = None;
+                    std::time::Duration::ZERO
+                }
+                Ok(None) => {
+                    let d = run::next_backoff(backoff);
+                    backoff = Some(d);
+                    run::jittered(d)
+                }
+                Err(e) => {
+                    eprintln!("work iteration failed: {e}");
+                    let d = run::next_backoff(backoff);
+                    backoff = Some(d);
+                    run::jittered(d)
+                }
+            };
+
+            // Race the backoff sleep against ctrl-c so a signal mid-sleep (or
+            // between busy iterations) exits cleanly.
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    println!("shutting down");
+                    return ExitCode::SUCCESS;
+                }
+            }
+        }
+    })
 }
 
 /// `init`: refuse if already initialized, else generate node key + wallet

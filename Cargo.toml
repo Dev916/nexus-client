@@ -1,9 +1,12 @@
+[workspace]
+members = ["agenc-worker"]
+
 [package]
 name = "nexus-client"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.93"
-description = "Lend your GPU to the Nexus compute network and earn GNN. Wraps a local OpenAI-compatible inference server (Ollama, vLLM, llama.cpp) and serves metered jobs."
+description = "Run a Nexus node: lend your GPU to the compute network for GNN, or `nexus-client work` as an AgenC provider and earn SOL building apps. Wraps a local OpenAI-compatible inference server (Ollama, vLLM, llama.cpp)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Dev916/nexus-client"
 homepage = "https://ghostnn.ai/nexus-client"
@@ -20,14 +23,12 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
 bs58 = "0.5"
+agenc-worker = { path = "agenc-worker" }
+anyhow = "1"
+sha2 = "0.10"
+hex = "0.4"
 solana-keypair = "2"
 solana-signer = "2"
-# Slim SPL/Solana stack for building + signing the GNN stake transfer_checked tx
-# (the `stake` subcommand). All openssl-free + static-build-safe.
-# solana-transaction MUST stay default-features=false so the
-# `precompiles -> secp256r1 -> openssl` chain is never pulled. NEVER add
-# solana-sdk / solana-client / solana-rpc-client here — they drag in openssl-sys
-# and break the static Windows/Linux release builds.
 spl-token = { version = "7", default-features = false }
 spl-associated-token-account = { version = "6", default-features = false }
 solana-program = "2"
@@ -45,31 +46,18 @@ zeroize = "1"
 dirs = "5"
 rand = "0.8"
 tokio = { version = "1", features = ["full"] }
-# rustls-tls-webpki-roots so wss:// gateways work everywhere without
-# linking system OpenSSL — required for the production gateway URL.
-tokio-tungstenite = { version = "0.20", default-features = false, features = [
-    "connect",
-    "handshake",
-    "rustls-tls-webpki-roots",
-] }
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "stream",
-    "rustls-tls",
-] }
+tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+wiremock = "0.6"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
 bs58 = "0.5"
 serde_json = "1"
-
-[profile.release]
-strip = true
-lto = "thin"

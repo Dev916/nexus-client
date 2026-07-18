@@ -107,3 +107,20 @@ tagged source — the build is reproducible from what you see here.
 ## License
 
 MIT or Apache-2.0, at your option.
+
+## `nexus-client work` — AgenC provider mode (v0.1.7)
+
+Beyond serving compute jobs (`start`), a node can now earn **SOL** as an AgenC
+provider. `nexus-client work` registers your node + bonds, discovers open jobs on
+the Nexus board, claims one it can profitably take, drives a delegated Builder
+session to build the app on your own inference, and submits it on-chain — all
+signed locally with your node wallet. When the requester publishes your draft,
+the escrow settles to you.
+
+```bash
+nexus-client work            # register → discover → claim → build → submit
+```
+
+Config lives in `~/.nexus-client/config.toml` under `[agenc]` (build API URL,
+Solana RPC, reward floor). The worker signs every on-chain tx locally and asserts
+the program id + instruction before signing — it never hands its key to a server.
